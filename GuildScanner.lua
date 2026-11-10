@@ -125,8 +125,11 @@ alertFrame:SetBackdropColor(0.08, 0.08, 0.1, 0.94)
 alertFrame:SetBackdropBorderColor(1.0, 0.82, 0.0, 1.0)
 
 -- Standard-Attribut für Linksklick: Auto-Target-Makro
+alertFrame:SetAttribute("type", "macro")
 alertFrame:SetAttribute("type1", "macro")
+alertFrame:SetAttribute("macrotext", "")
 alertFrame:SetAttribute("macrotext1", "")
+alertFrame:SetAttribute("type2", "")
 
 -- Glow-Overlay für optisches Aufleuchten bei Alarm
 local glowBorder = CreateFrame("Frame", nil, alertFrame, "BackdropTemplate")
@@ -194,7 +197,7 @@ guildText:SetWordWrap(false)
 -- Hinweis-Zeile unten
 local hintText = alertFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 hintText:SetPoint("BOTTOM", alertFrame, "BOTTOM", 0, 7)
-hintText:SetText("Linksklick: Anvisieren  |  Ziehen: Bewegen")
+hintText:SetText("Linksklick: Anvisieren  |  Shift+Ziehen: Bewegen")
 
 -- Schließen-Button oben rechts (UIPanelCloseButton)
 local closeButton = CreateFrame("Button", nil, alertFrame, "UIPanelCloseButton")
@@ -214,23 +217,29 @@ alertFrame:HookScript("PostClick", function(self, button)
     end
 end)
 
--- Drag & Drop zum Verschieben (außerhalb des Kampfes)
+-- Drag & Drop zum Verschieben (Nur mit gehaltener Shift-Taste, damit normale Klicks mit Mausbewegung nicht als Drag verschluckt werden!)
 alertFrame:SetScript("OnDragStart", function(self)
     if InCombatLockdown() then
         PrintMsg("|cffff5555Das Popup kann im Kampf nicht verschoben werden.|r")
         return
     end
-    self:StartMoving()
+    if IsShiftKeyDown() then
+        self:StartMoving()
+        self.isMoving = true
+    end
 end)
 
 alertFrame:SetScript("OnDragStop", function(self)
-    self:StopMovingOrSizing()
-    if GuildScannerDB then
-        local point, _, relativePoint, xOfs, yOfs = self:GetPoint()
-        GuildScannerDB.point = point or "CENTER"
-        GuildScannerDB.relativePoint = relativePoint or "CENTER"
-        GuildScannerDB.xOfs = xOfs or 0
-        GuildScannerDB.yOfs = yOfs or -180
+    if self.isMoving then
+        self:StopMovingOrSizing()
+        self.isMoving = false
+        if GuildScannerDB then
+            local point, _, relativePoint, xOfs, yOfs = self:GetPoint()
+            GuildScannerDB.point = point or "CENTER"
+            GuildScannerDB.relativePoint = relativePoint or "CENTER"
+            GuildScannerDB.xOfs = xOfs or 0
+            GuildScannerDB.yOfs = yOfs or -180
+        end
     end
 end)
 
@@ -248,7 +257,7 @@ alertFrame:SetScript("OnEnter", function(self)
     GameTooltip:AddLine(" ")
     GameTooltip:AddLine("Linksklick: Spieler ins Ziel nehmen (/target)", 0.8, 0.8, 0.8)
     GameTooltip:AddLine("Rechtsklick / X: Schließen (außerhalb des Kampfes)", 0.8, 0.8, 0.8)
-    GameTooltip:AddLine("Linksklick-Ziehen: Fenster verschieben", 0.8, 0.8, 0.8)
+    GameTooltip:AddLine("Shift + Linksklick-Ziehen: Fenster verschieben", 0.8, 0.8, 0.8)
     GameTooltip:Show()
 end)
 
@@ -293,9 +302,17 @@ local function ApplyAndShowAlert(alertData, playAudio)
     local classFile = alertData.classFile
     local factionGroup = alertData.factionGroup
 
-    -- Secure Macro Attribut aktualisieren (/target statt /targetexact für Vor- & Nachnamen in WoW Forever)
+    -- Secure Macro Attribut aktualisieren (Sowohl für "type1" als auch generisch "type", damit Down- und Up-Klicks in WoW 12.x/Forever unabhängig von ActionButtonUseKeyDown sofort feuern)
+    local firstName = exactName:match("^([^%s%-]+)") or exactName
+    local macroCmd = "/target " .. exactName
+    if firstName ~= exactName then
+        macroCmd = "/target " .. exactName .. "\n/target " .. firstName
+    end
+    alertFrame:SetAttribute("type", "macro")
     alertFrame:SetAttribute("type1", "macro")
-    alertFrame:SetAttribute("macrotext1", "/target " .. exactName)
+    alertFrame:SetAttribute("macrotext", macroCmd)
+    alertFrame:SetAttribute("macrotext1", macroCmd)
+    alertFrame:SetAttribute("type2", "")
 
     -- Text & Farben aktualisieren
     local colorHex = GetClassColorHex(classFile)
@@ -846,7 +863,7 @@ GuildScanner:SetScript("OnEvent", function(self, event, arg1)
                 minimapButton:Show()
             end
             RegisterBlizzardOptionsPanel()
-            PrintMsg("Geladen (v1.1.1). Klicke auf das |cffffd100Minimap-Icon|r oder tippe |cffffd100/gscan|r.")
+            PrintMsg("Geladen (v1.1.2). Klicke auf das |cffffd100Minimap-Icon|r oder tippe |cffffd100/gscan|r.")
         end
     elseif event == "NAME_PLATE_UNIT_ADDED" then
         CheckUnit(arg1, false)
