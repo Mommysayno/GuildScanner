@@ -3,4 +3,6 @@ package-as: GuildScanner
 ignore:
   - .gitignore
   - .pkgmeta
+  - .github
   - README.md
+

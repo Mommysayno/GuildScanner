@@ -4,6 +4,8 @@ Thumbs.db
 Desktop.ini
 *.bak
 *.tmp
+*.zip
 *~
 .vscode/
 .idea/
+
