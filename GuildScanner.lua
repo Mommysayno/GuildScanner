@@ -246,7 +246,7 @@ alertFrame:SetScript("OnEnter", function(self)
         GameTooltip:AddLine("Gilde: <" .. self.currentGuildName .. ">" .. rankInfo, 0.2, 1.0, 0.2)
     end
     GameTooltip:AddLine(" ")
-    GameTooltip:AddLine("Linksklick: Spieler ins Ziel nehmen (/targetexact)", 0.8, 0.8, 0.8)
+    GameTooltip:AddLine("Linksklick: Spieler ins Ziel nehmen (/target)", 0.8, 0.8, 0.8)
     GameTooltip:AddLine("Rechtsklick / X: Schließen (außerhalb des Kampfes)", 0.8, 0.8, 0.8)
     GameTooltip:AddLine("Linksklick-Ziehen: Fenster verschieben", 0.8, 0.8, 0.8)
     GameTooltip:Show()
@@ -293,9 +293,9 @@ local function ApplyAndShowAlert(alertData, playAudio)
     local classFile = alertData.classFile
     local factionGroup = alertData.factionGroup
 
-    -- Secure Macro Attribut aktualisieren
+    -- Secure Macro Attribut aktualisieren (/target statt /targetexact für Vor- & Nachnamen in WoW Forever)
     alertFrame:SetAttribute("type1", "macro")
-    alertFrame:SetAttribute("macrotext1", "/targetexact " .. exactName)
+    alertFrame:SetAttribute("macrotext1", "/target " .. exactName)
 
     -- Text & Farben aktualisieren
     local colorHex = GetClassColorHex(classFile)
@@ -846,7 +846,7 @@ GuildScanner:SetScript("OnEvent", function(self, event, arg1)
                 minimapButton:Show()
             end
             RegisterBlizzardOptionsPanel()
-            PrintMsg("Geladen (v1.1.0). Klicke auf das |cffffd100Minimap-Icon|r oder tippe |cffffd100/gscan|r.")
+            PrintMsg("Geladen (v1.1.1). Klicke auf das |cffffd100Minimap-Icon|r oder tippe |cffffd100/gscan|r.")
         end
     elseif event == "NAME_PLATE_UNIT_ADDED" then
         CheckUnit(arg1, false)
