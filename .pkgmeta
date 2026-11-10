@@ -1,0 +1,6 @@
+package-as: GuildScanner
+
+ignore:
+  - .gitignore
+  - .pkgmeta
+  - README.md
