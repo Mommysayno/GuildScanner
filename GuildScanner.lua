@@ -54,12 +54,38 @@ local function GetClassColorHex(classFile)
     return "ffffffff", 1.0, 1.0, 1.0
 end
 
+local function IsSecret(val)
+    if issecretvalue and issecretvalue(val) then
+        return true
+    end
+    return false
+end
+
+local function SafeIsTrue(val)
+    if IsSecret(val) then
+        return false
+    end
+    return val and true or false
+end
+
+local function SafeString(val)
+    if val == nil or IsSecret(val) then
+        return nil
+    end
+    if type(val) ~= "string" or val == "" then
+        return nil
+    end
+    return val
+end
+
 local function GetFullPlayerName(unit)
     local name, realm = UnitName(unit)
+    name = SafeString(name)
     if not name or name == UNKNOWNOBJECT then
         return nil
     end
-    if realm and realm ~= "" then
+    realm = SafeString(realm)
+    if realm then
         return name .. "-" .. realm
     end
     return name
@@ -521,16 +547,16 @@ addTargetGuildBtn:SetSize(340, 22)
 addTargetGuildBtn:SetPoint("TOPLEFT", guildEditBox, "BOTTOMLEFT", -5, -6)
 addTargetGuildBtn:SetText("Gilde des aktuellen Ziels (Target) hinzufügen")
 addTargetGuildBtn:SetScript("OnClick", function()
-    if UnitIsForbidden and UnitIsForbidden("target") then
+    if UnitIsForbidden and SafeIsTrue(UnitIsForbidden("target")) then
         PrintMsg("|cffff5555Ziel ist durch Client-Restriktionen geschützt.|r")
         return
     end
-    if not UnitExists("target") or not UnitIsPlayer("target") then
+    if not SafeIsTrue(UnitExists("target")) or not SafeIsTrue(UnitIsPlayer("target")) then
         PrintMsg("|cffff5555Bitte visiere zuerst einen Spieler an.|r")
         return
     end
-    local gName = GetGuildInfo("target")
-    if not gName or gName == "" then
+    local gName = SafeString(GetGuildInfo("target"))
+    if not gName then
         PrintMsg("|cffff5555Das aktuelle Ziel ist in keiner Gilde.|r")
         return
     end
@@ -793,29 +819,36 @@ local function IsPlayerOnCooldown(shortName)
     return false
 end
 
-local function CheckUnit(unit, allowSelfForTest)
-    if not unit then return end
+local function CheckUnitInternal(unit, allowSelfForTest)
+    if not unit or IsSecret(unit) then return end
 
     -- 1. Midnight-Restriktionen prüfen: Verbotene Units sofort überspringen
-    if UnitIsForbidden and UnitIsForbidden(unit) then
+    if UnitIsForbidden and SafeIsTrue(UnitIsForbidden(unit)) then
         return
     end
 
-    -- 2. Existenz- und Spieler-Prüfung
-    if not UnitExists(unit) or not UnitIsPlayer(unit) then
+    -- 2. Existenz- und Spieler-Prüfung (Secret-Boolean-sicher)
+    local exists = UnitExists(unit)
+    local isPlayer = UnitIsPlayer(unit)
+    if IsSecret(exists) or IsSecret(isPlayer) or not exists or not isPlayer then
         return
     end
 
-    -- 3. Eigenen Charakter im Normalbetrieb ausschließen
-    if not allowSelfForTest and UnitIsUnit(unit, "player") then
-        return
+    -- 3. Eigenen Charakter im Normalbetrieb ausschließen (Secret-Boolean-sicher!)
+    if not allowSelfForTest then
+        local isSelf = UnitIsUnit(unit, "player")
+        if IsSecret(isSelf) or isSelf then
+            return
+        end
     end
 
     -- 4. Gildeninformationen auslesen
-    local guildName, guildRankName = GetGuildInfo(unit)
-    if not guildName or guildName == "" then
+    local rawGuildName, rawGuildRank = GetGuildInfo(unit)
+    local guildName = SafeString(rawGuildName)
+    if not guildName then
         return
     end
+    local guildRankName = SafeString(rawGuildRank)
 
     -- 5. Case-Insensitive Abgleich mit der Watchlist
     local guildKey = string.lower(guildName)
@@ -830,16 +863,22 @@ local function CheckUnit(unit, allowSelfForTest)
         return
     end
 
-    local shortName = Ambiguate(fullName, "none")
+    local shortName = SafeString(Ambiguate(fullName, "none")) or fullName
     if not allowSelfForTest and IsPlayerOnCooldown(shortName) then
         return
     end
 
     -- 7. Klassen- & Fraktionsdaten für das Popup ermitteln
-    local _, classFile = UnitClass(unit)
-    local factionGroup = UnitFactionGroup(unit)
+    local _, rawClassFile = UnitClass(unit)
+    local classFile = SafeString(rawClassFile)
+    local factionGroup = SafeString(UnitFactionGroup(unit))
 
     TriggerAlert(shortName, shortName, guildName, guildRankName, classFile, factionGroup)
+end
+
+local function CheckUnit(unit, allowSelfForTest)
+    -- Zusätzlicher pcall-Schutz gegen unvorhergesehene Midnight/Forever Secret-Value-Restriktionen
+    pcall(CheckUnitInternal, unit, allowSelfForTest)
 end
 
 -- ============================================================================
@@ -863,7 +902,7 @@ GuildScanner:SetScript("OnEvent", function(self, event, arg1)
                 minimapButton:Show()
             end
             RegisterBlizzardOptionsPanel()
-            PrintMsg("Geladen (v1.1.2). Klicke auf das |cffffd100Minimap-Icon|r oder tippe |cffffd100/gscan|r.")
+            PrintMsg("Geladen (v1.1.3). Klicke auf das |cffffd100Minimap-Icon|r oder tippe |cffffd100/gscan|r.")
         end
     elseif event == "NAME_PLATE_UNIT_ADDED" then
         CheckUnit(arg1, false)
@@ -872,7 +911,9 @@ GuildScanner:SetScript("OnEvent", function(self, event, arg1)
     elseif event == "PLAYER_TARGET_CHANGED" then
         CheckUnit("target", false)
     elseif event == "UNIT_TARGET" then
-        if arg1 and arg1 ~= "player" then
+        -- Verkettete Nameplate-Targets (z.B. "nameplate2target") liefern in 12.x/Forever
+        -- geschützte "Secret Values" (<secret boolean>), daher nur sichere Unit-Tokens prüfen
+        if arg1 and not IsSecret(arg1) and arg1 ~= "player" and not string.find(arg1, "^nameplate") then
             CheckUnit(arg1 .. "target", false)
         end
     elseif event == "PLAYER_REGEN_ENABLED" then
