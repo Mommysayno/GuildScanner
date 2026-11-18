@@ -34,6 +34,7 @@ local DEFAULT_DB = {
     hideMinimapButton = false,
     soundEnabled = true,
     leaderboardEnabled = true,
+    broadcastKillsRealtime = true,
     leaderboard = {
         players = {}, -- [killerName] = { kills = 0, classFile = "WARRIOR", byGuild = { [guildKey] = count }, updated = 0 }
         guilds = {},  -- [guildKey] = { name = "Original Name", kills = 0 }
@@ -266,17 +267,20 @@ local function RecordWatchedGuildKill(killerName, killerClass, victimName, victi
             origGuildName,
             pEntry.kills
         ))
-        -- Sofort an alle Gildenmitglieder senden: KILL|killer|class|guildName|newGuildCount|victimName
-        local newGuildCount = pEntry.byGuild[guildKey] or 1
-        local msg = string.format(
-            "KILL|%s|%s|%s|%d|%s",
-            killerName,
-            pEntry.classFile or "WARRIOR",
-            origGuildName,
-            newGuildCount,
-            victimName or "Unbekannt"
-        )
-        SendGuildAddonMessage(msg)
+        -- Sofort an alle Gildenmitglieder senden (sofern Echtzeit-Broadcast aktiviert ist):
+        -- KILL|killer|class|guildName|newGuildCount|victimName
+        if GuildScannerDB.broadcastKillsRealtime ~= false then
+            local newGuildCount = pEntry.byGuild[guildKey] or 1
+            local msg = string.format(
+                "KILL|%s|%s|%s|%d|%s",
+                killerName,
+                pEntry.classFile or "WARRIOR",
+                origGuildName,
+                newGuildCount,
+                victimName or "Unbekannt"
+            )
+            SendGuildAddonMessage(msg)
+        end
     end
 
     if RefreshLeaderboardUI then
@@ -755,6 +759,9 @@ local function InitializeDatabase()
     if GuildScannerDB.leaderboardEnabled == nil then
         GuildScannerDB.leaderboardEnabled = DEFAULT_DB.leaderboardEnabled
     end
+    if GuildScannerDB.broadcastKillsRealtime == nil then
+        GuildScannerDB.broadcastKillsRealtime = DEFAULT_DB.broadcastKillsRealtime
+    end
     EnsureLeaderboardTables()
     RebuildGuildTotalsFromPlayers()
     RestoreFramePosition()
@@ -764,7 +771,7 @@ end
 -- Einstellungsfenster (GUI)
 -- ============================================================================
 local configFrame = CreateFrame("Frame", "GuildScannerConfigFrame", UIParent, "BackdropTemplate")
-configFrame:SetSize(380, 495)
+configFrame:SetSize(380, 520)
 configFrame:SetPoint("CENTER")
 configFrame:SetFrameStrata("DIALOG")
 configFrame:SetClampedToScreen(true)
@@ -970,16 +977,46 @@ lbCheckbox:SetSize(24, 24)
 lbCheckbox:SetPoint("TOPLEFT", soundCheckbox, "BOTTOMLEFT", 0, -2)
 local lbLabel = lbCheckbox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 lbLabel:SetPoint("LEFT", lbCheckbox, "RIGHT", 4, 0)
-lbLabel:SetText("Gilden-Kill-Leaderboard aktivieren & mit Gilde synchronisieren")
+lbLabel:SetText("Gilden-Kill-Leaderboard aktivieren & synchronisieren")
+
+-- Echtzeit-Broadcast-Checkbox (Eigener Haken für Echtzeit-Übertragung neuer Kills)
+local broadcastCheckbox = CreateFrame("CheckButton", "GuildScannerBroadcastKillsCheck", configFrame, "UICheckButtonTemplate")
+broadcastCheckbox:SetSize(24, 24)
+broadcastCheckbox:SetPoint("TOPLEFT", lbCheckbox, "BOTTOMLEFT", 0, -2)
+local broadcastLabel = broadcastCheckbox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+broadcastLabel:SetPoint("LEFT", broadcastCheckbox, "RIGHT", 4, 0)
+broadcastLabel:SetText("Neue Kills in Echtzeit an Gildenmitglieder senden")
+
+local function UpdateBroadcastCheckboxState()
+    if GuildScannerDB and GuildScannerDB.leaderboardEnabled ~= false then
+        broadcastCheckbox:Enable()
+        broadcastLabel:SetTextColor(1.0, 0.82, 0.0)
+    else
+        broadcastCheckbox:Disable()
+        broadcastLabel:SetTextColor(0.5, 0.5, 0.5)
+    end
+end
 
 lbCheckbox:SetScript("OnClick", function(self)
     if GuildScannerDB then
         GuildScannerDB.leaderboardEnabled = self:GetChecked() and true or false
+        UpdateBroadcastCheckboxState()
         if GuildScannerDB.leaderboardEnabled then
             PrintMsg("Gilden-Leaderboard |cff40ff40aktiviert|r.")
             RequestGuildLeaderboardSync(false)
         else
             PrintMsg("Gilden-Leaderboard |cffff5555deaktiviert|r.")
+        end
+    end
+end)
+
+broadcastCheckbox:SetScript("OnClick", function(self)
+    if GuildScannerDB then
+        GuildScannerDB.broadcastKillsRealtime = self:GetChecked() and true or false
+        if GuildScannerDB.broadcastKillsRealtime then
+            PrintMsg("Echtzeit-Übertragung neuer Kills an die Gilde |cff40ff40aktiviert|r.")
+        else
+            PrintMsg("Echtzeit-Übertragung neuer Kills an die Gilde |cffff5555deaktiviert|r.")
         end
     end
 end)
@@ -1019,6 +1056,8 @@ ToggleConfigFrame = function()
     else
         soundCheckbox:SetChecked(GuildScannerDB.soundEnabled ~= false)
         lbCheckbox:SetChecked(GuildScannerDB.leaderboardEnabled ~= false)
+        broadcastCheckbox:SetChecked(GuildScannerDB.broadcastKillsRealtime ~= false)
+        UpdateBroadcastCheckboxState()
         RefreshWatchlistUI()
         configFrame:Show()
     end
