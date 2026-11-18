@@ -1,8 +1,8 @@
 ## Interface: 16001
 ## Title: GuildScanner (WoW Forever)
-## Notes: Warnt mit einem Auto-Target-Popup, wenn Spieler bestimmter Gilden in der Nähe sind.
+## Notes: Warnt mit einem Auto-Target-Popup, wenn Spieler bestimmter Gilden in der Nähe sind, inkl. Gilden-Kill-Leaderboard.
 ## Author: GuildScanner Dev
-## Version: 1.1.3
+## Version: 1.2.0
 ## SavedVariables: GuildScannerDB
 
 GuildScanner.lua

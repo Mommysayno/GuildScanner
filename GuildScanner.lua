@@ -2,8 +2,8 @@
 -- GuildScanner - World of Warcraft: Forever (Client 1.60.1 / Interface 16001)
 -- ============================================================================
 -- Kompatibel mit Midnight/Forever Engine-Restriktionen (Kein Combat Log,
--- UnitIsForbidden-Prüfung, SecureActionButton Combat-Lockdown-Queue).
--- Inklusive Einstellungs-GUI, Blizzard AddOn-Options & Minimap-Button.
+-- UnitIsForbidden/SecretValue-Prüfung, SecureActionButton Combat-Lockdown-Queue).
+-- Inklusive Einstellungs-GUI, Minimap-Button & synchronisiertem Gilden-Leaderboard.
 -- ============================================================================
 
 local ADDON_NAME = ...
@@ -13,7 +13,13 @@ local GuildScanner = CreateFrame("Frame", "GuildScannerEventFrame")
 -- Konstanten & Lokale Variablen
 -- ============================================================================
 local COOLDOWN_SECONDS = 60
+local KILL_DEDUP_SECONDS = 45
+local COMM_PREFIX = "GScanLB"
+
 local recentDetections = {} -- [playerName] = timestamp (GetTime)
+local recentKills = {}      -- [victimName] = timestamp (GetTime)
+local trackedUnits = {}     -- [unitToken] = { name, guildName, guildKey, classFile, wasAlive }
+local lastDamagedTarget = nil -- { name, guildName, guildKey, time }
 local pendingAlert = nil    -- Speichert { exactName, displayName, guildName, guildRank, classFile, factionGroup } während Kampf
 
 local PREFIX = "|cff00ccff[GuildScanner]|r "
@@ -27,15 +33,24 @@ local DEFAULT_DB = {
     minimapAngle = 225,
     hideMinimapButton = false,
     soundEnabled = true,
+    leaderboardEnabled = true,
+    leaderboard = {
+        players = {}, -- [killerName] = { kills = 0, classFile = "WARRIOR", byGuild = { [guildKey] = count }, updated = 0 }
+        guilds = {},  -- [guildKey] = { name = "Original Name", kills = 0 }
+    },
 }
 
 -- Vorwärtsdeklarationen für UI-Updates
 local RefreshWatchlistUI
+local RefreshLeaderboardUI
 local ToggleConfigFrame
+local ToggleLeaderboardFrame
 local UpdateMinimapButtonPosition
+local RequestGuildLeaderboardSync
+local BroadcastGuildLeaderboardState
 
 -- ============================================================================
--- Hilfsfunktionen
+-- Hilfsfunktionen & Secret-Value-Schutz (WoW 12.x / Forever)
 -- ============================================================================
 local function PrintMsg(msg)
     DEFAULT_CHAT_FRAME:AddMessage(PREFIX .. tostring(msg))
@@ -44,14 +59,6 @@ end
 local function Trim(str)
     if not str then return "" end
     return str:match("^%s*(.-)%s*$") or ""
-end
-
-local function GetClassColorHex(classFile)
-    if classFile and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile] then
-        local c = RAID_CLASS_COLORS[classFile]
-        return c.colorStr or string.format("ff%02x%02x%02x", c.r * 255, c.g * 255, c.b * 255), c.r, c.g, c.b
-    end
-    return "ffffffff", 1.0, 1.0, 1.0
 end
 
 local function IsSecret(val)
@@ -78,6 +85,14 @@ local function SafeString(val)
     return val
 end
 
+local function GetClassColorHex(classFile)
+    if classFile and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile] then
+        local c = RAID_CLASS_COLORS[classFile]
+        return c.colorStr or string.format("ff%02x%02x%02x", c.r * 255, c.g * 255, c.b * 255), c.r, c.g, c.b
+    end
+    return "ffffffff", 1.0, 1.0, 1.0
+end
+
 local function GetFullPlayerName(unit)
     local name, realm = UnitName(unit)
     name = SafeString(name)
@@ -89,6 +104,12 @@ local function GetFullPlayerName(unit)
         return name .. "-" .. realm
     end
     return name
+end
+
+local function GetLocalPlayerShortName()
+    local fullName = GetFullPlayerName("player")
+    if not fullName then return "Spieler" end
+    return SafeString(Ambiguate(fullName, "none")) or fullName
 end
 
 -- ============================================================================
@@ -106,6 +127,9 @@ local function AddGuildToWatchlist(guildName)
     if RefreshWatchlistUI then
         RefreshWatchlistUI()
     end
+    if RefreshLeaderboardUI then
+        RefreshLeaderboardUI()
+    end
     return true
 end
 
@@ -120,10 +144,279 @@ local function RemoveGuildFromWatchlist(guildNameOrKey)
         if RefreshWatchlistUI then
             RefreshWatchlistUI()
         end
+        if RefreshLeaderboardUI then
+            RefreshLeaderboardUI()
+        end
         return true
     else
         PrintMsg(string.format("Gilde |cffff5555<%s>|r befindet sich nicht auf der Watchlist.", guildNameOrKey))
         return false
+    end
+end
+
+-- ============================================================================
+-- Leaderboard-Datenbank & Gilden-Synchronisation (C_ChatInfo Addon-Channel)
+-- ============================================================================
+local function EnsureLeaderboardTables()
+    if not GuildScannerDB then return end
+    if type(GuildScannerDB.leaderboard) ~= "table" then
+        GuildScannerDB.leaderboard = { players = {}, guilds = {} }
+    end
+    if type(GuildScannerDB.leaderboard.players) ~= "table" then
+        GuildScannerDB.leaderboard.players = {}
+    end
+    if type(GuildScannerDB.leaderboard.guilds) ~= "table" then
+        GuildScannerDB.leaderboard.guilds = {}
+    end
+end
+
+local function RebuildGuildTotalsFromPlayers()
+    EnsureLeaderboardTables()
+    local lb = GuildScannerDB.leaderboard
+    local computedGuilds = {}
+
+    for _, pData in pairs(lb.players) do
+        if type(pData.byGuild) == "table" then
+            local sum = 0
+            for gKey, count in pairs(pData.byGuild) do
+                if type(count) == "number" and count > 0 then
+                    sum = sum + count
+                    computedGuilds[gKey] = (computedGuilds[gKey] or 0) + count
+                end
+            end
+            if sum > (pData.kills or 0) then
+                pData.kills = sum
+            end
+        end
+    end
+
+    for gKey, totalCount in pairs(computedGuilds) do
+        local displayName = (GuildScannerDB.watchlist and GuildScannerDB.watchlist[gKey])
+            or (lb.guilds[gKey] and lb.guilds[gKey].name)
+            or gKey
+        lb.guilds[gKey] = {
+            name = displayName,
+            kills = totalCount,
+        }
+    end
+end
+
+local function SendGuildAddonMessage(payload)
+    if not GuildScannerDB or not GuildScannerDB.leaderboardEnabled then return end
+    if not IsInGuild or not IsInGuild() then return end
+    if C_ChatInfo and C_ChatInfo.SendAddonMessage then
+        pcall(C_ChatInfo.SendAddonMessage, COMM_PREFIX, payload, "GUILD")
+    elseif SendAddonMessage then
+        pcall(SendAddonMessage, COMM_PREFIX, payload, "GUILD")
+    end
+end
+
+-- Registriert einen neuen Kill (lokal oder empfangen) und synchronisiert ihn
+local function RecordWatchedGuildKill(killerName, killerClass, victimName, victimGuildName, isRemote)
+    if not GuildScannerDB or not GuildScannerDB.leaderboardEnabled then return end
+    EnsureLeaderboardTables()
+
+    killerName = SafeString(killerName)
+    victimGuildName = SafeString(victimGuildName)
+    if not killerName or not victimGuildName then return end
+
+    killerName = SafeString(Ambiguate(killerName, "none")) or killerName
+    local guildKey = string.lower(Trim(victimGuildName))
+    if guildKey == "" then return end
+
+    local lb = GuildScannerDB.leaderboard
+    local pEntry = lb.players[killerName]
+    if not pEntry then
+        pEntry = {
+            kills = 0,
+            classFile = SafeString(killerClass) or "WARRIOR",
+            byGuild = {},
+            updated = GetServerTime and GetServerTime() or time(),
+        }
+        lb.players[killerName] = pEntry
+    end
+
+    if SafeString(killerClass) then
+        pEntry.classFile = killerClass
+    end
+    if type(pEntry.byGuild) ~= "table" then
+        pEntry.byGuild = {}
+    end
+
+    pEntry.kills = (pEntry.kills or 0) + 1
+    pEntry.byGuild[guildKey] = (pEntry.byGuild[guildKey] or 0) + 1
+    pEntry.updated = GetServerTime and GetServerTime() or time()
+
+    local origGuildName = (GuildScannerDB.watchlist and GuildScannerDB.watchlist[guildKey]) or victimGuildName
+    if not lb.guilds[guildKey] then
+        lb.guilds[guildKey] = { name = origGuildName, kills = 0 }
+    else
+        lb.guilds[guildKey].name = origGuildName
+    end
+
+    RebuildGuildTotalsFromPlayers()
+
+    if not isRemote then
+        local colorHex = GetClassColorHex(pEntry.classFile)
+        PrintMsg(string.format(
+            "|cffffd100[Leaderboard]|r Kill gezählt! |c%s%s|r hat |cffff5555%s|r (|cff40ff40<%s>|r) besiegt! (Gesamt: %d)",
+            colorHex,
+            killerName,
+            victimName or "Gegner",
+            origGuildName,
+            pEntry.kills
+        ))
+        -- Sofort an alle Gildenmitglieder senden: KILL|killer|class|guildName|newGuildCount|victimName
+        local newGuildCount = pEntry.byGuild[guildKey] or 1
+        local msg = string.format(
+            "KILL|%s|%s|%s|%d|%s",
+            killerName,
+            pEntry.classFile or "WARRIOR",
+            origGuildName,
+            newGuildCount,
+            victimName or "Unbekannt"
+        )
+        SendGuildAddonMessage(msg)
+    end
+
+    if RefreshLeaderboardUI then
+        RefreshLeaderboardUI()
+    end
+end
+
+-- Merge-Funktion für empfangene Synchronisationsdaten (nimmt jeweils das Maximum pro Spieler & Gilde)
+local function MergeSyncedPlayerGuildCount(killerName, killerClass, guildNameRaw, countNum)
+    if not GuildScannerDB or not GuildScannerDB.leaderboardEnabled then return end
+    EnsureLeaderboardTables()
+
+    killerName = SafeString(killerName)
+    guildNameRaw = SafeString(guildNameRaw)
+    countNum = tonumber(countNum)
+    if not killerName or not guildNameRaw or not countNum or countNum <= 0 then return end
+
+    killerName = SafeString(Ambiguate(killerName, "none")) or killerName
+    local guildKey = string.lower(Trim(guildNameRaw))
+    if guildKey == "" then return end
+
+    local lb = GuildScannerDB.leaderboard
+    local pEntry = lb.players[killerName]
+    if not pEntry then
+        pEntry = {
+            kills = 0,
+            classFile = SafeString(killerClass) or "WARRIOR",
+            byGuild = {},
+            updated = GetServerTime and GetServerTime() or time(),
+        }
+        lb.players[killerName] = pEntry
+    end
+
+    if SafeString(killerClass) and killerClass ~= "UNKNOWN" then
+        pEntry.classFile = killerClass
+    end
+    if type(pEntry.byGuild) ~= "table" then
+        pEntry.byGuild = {}
+    end
+
+    local currentCount = pEntry.byGuild[guildKey] or 0
+    if countNum > currentCount then
+        pEntry.byGuild[guildKey] = countNum
+    end
+
+    if not lb.guilds[guildKey] then
+        lb.guilds[guildKey] = {
+            name = (GuildScannerDB.watchlist and GuildScannerDB.watchlist[guildKey]) or guildNameRaw,
+            kills = 0,
+        }
+    end
+
+    -- Gesamtkills des Spielers neu summieren
+    local totalPlayerKills = 0
+    for _, c in pairs(pEntry.byGuild) do
+        totalPlayerKills = totalPlayerKills + (tonumber(c) or 0)
+    end
+    if totalPlayerKills > (pEntry.kills or 0) then
+        pEntry.kills = totalPlayerKills
+    end
+
+    RebuildGuildTotalsFromPlayers()
+    if RefreshLeaderboardUI then
+        RefreshLeaderboardUI()
+    end
+end
+
+BroadcastGuildLeaderboardState = function()
+    if not GuildScannerDB or not GuildScannerDB.leaderboardEnabled then return end
+    if not IsInGuild or not IsInGuild() then return end
+    EnsureLeaderboardTables()
+
+    local lb = GuildScannerDB.leaderboard
+    for killerName, pData in pairs(lb.players) do
+        local classFile = pData.classFile or "WARRIOR"
+        if type(pData.byGuild) == "table" then
+            for gKey, count in pairs(pData.byGuild) do
+                if type(count) == "number" and count > 0 then
+                    local gName = (lb.guilds[gKey] and lb.guilds[gKey].name)
+                        or (GuildScannerDB.watchlist and GuildScannerDB.watchlist[gKey])
+                        or gKey
+                    local payload = string.format("STATE|%s|%s|%s|%d", killerName, classFile, gName, count)
+                    SendGuildAddonMessage(payload)
+                end
+            end
+        end
+    end
+end
+
+local lastSyncRequestTime = 0
+RequestGuildLeaderboardSync = function(manual)
+    if not GuildScannerDB or not GuildScannerDB.leaderboardEnabled then
+        if manual then
+            PrintMsg("|cffff5555Das Leaderboard ist aktuell in den Einstellungen deaktiviert.|r")
+        end
+        return
+    end
+    if not IsInGuild or not IsInGuild() then
+        if manual then
+            PrintMsg("|cffff5555Du musst in einer Gilde sein, um das Leaderboard zu synchronisieren.|r")
+        end
+        return
+    end
+    local now = GetTime()
+    if not manual and (now - lastSyncRequestTime) < 15 then
+        return
+    end
+    lastSyncRequestTime = now
+    SendGuildAddonMessage("REQSYNC")
+    BroadcastGuildLeaderboardState()
+    if manual then
+        PrintMsg("Synchronisiere Leaderboard mit allen Gildenmitgliedern...")
+    end
+end
+
+local function HandleAddonMessage(prefix, message, channel, sender)
+    if prefix ~= COMM_PREFIX or channel ~= "GUILD" then return end
+    if not GuildScannerDB or not GuildScannerDB.leaderboardEnabled then return end
+    if IsSecret(message) or IsSecret(sender) then return end
+
+    local senderShort = SafeString(Ambiguate(sender or "", "none")) or sender
+    local myShort = GetLocalPlayerShortName()
+
+    if message == "REQSYNC" then
+        if senderShort ~= myShort then
+            -- Zufällige kleine Verzögerung (0.5 - 2.5s), um Channel-Throttle zu vermeiden
+            local delay = 0.5 + (math.random() * 2.0)
+            C_Timer.After(delay, function()
+                BroadcastGuildLeaderboardState()
+            end)
+        end
+        return
+    end
+
+    local cmd, a1, a2, a3, a4 = strsplit("|", message)
+    if cmd == "KILL" or cmd == "STATE" then
+        -- Format: CMD|killerName|classFile|guildName|guildKillCount|victimName
+        if a1 and a2 and a3 and a4 then
+            MergeSyncedPlayerGuildCount(a1, a2, a3, tonumber(a4))
+        end
     end
 end
 
@@ -243,7 +536,7 @@ alertFrame:HookScript("PostClick", function(self, button)
     end
 end)
 
--- Drag & Drop zum Verschieben (Nur mit gehaltener Shift-Taste, damit normale Klicks mit Mausbewegung nicht als Drag verschluckt werden!)
+-- Drag & Drop zum Verschieben (Nur mit gehaltener Shift-Taste, damit normale Klicks nicht verschluckt werden!)
 alertFrame:SetScript("OnDragStart", function(self)
     if InCombatLockdown() then
         PrintMsg("|cffff5555Das Popup kann im Kampf nicht verschoben werden.|r")
@@ -328,7 +621,7 @@ local function ApplyAndShowAlert(alertData, playAudio)
     local classFile = alertData.classFile
     local factionGroup = alertData.factionGroup
 
-    -- Secure Macro Attribut aktualisieren (Sowohl für "type1" als auch generisch "type", damit Down- und Up-Klicks in WoW 12.x/Forever unabhängig von ActionButtonUseKeyDown sofort feuern)
+    -- Secure Macro Attribut aktualisieren
     local firstName = exactName:match("^([^%s%-]+)") or exactName
     local macroCmd = "/target " .. exactName
     if firstName ~= exactName then
@@ -397,18 +690,16 @@ local function TriggerAlert(exactName, displayName, guildName, guildRank, classF
 end
 
 local function RunTestAlert()
-    local playerName = UnitName("player") or "Spieler"
-    local shortName = Ambiguate(playerName, "none")
+    local playerName = GetLocalPlayerShortName()
     local guildName, guildRank = GetGuildInfo("player")
-    if not guildName or guildName == "" then
-        guildName = "Testgilde Forever"
-        guildRank = "Gildenmeister"
-    end
-    local _, classFile = UnitClass("player")
-    local factionGroup = UnitFactionGroup("player")
+    guildName = SafeString(guildName) or "Testgilde Forever"
+    guildRank = SafeString(guildRank) or "Gildenmeister"
+    local _, rawClass = UnitClass("player")
+    local classFile = SafeString(rawClass)
+    local factionGroup = SafeString(UnitFactionGroup("player"))
 
-    PrintMsg("Starte Test-Alarm für |cffffd100" .. shortName .. "|r...")
-    TriggerAlert(shortName, shortName, guildName, guildRank, classFile, factionGroup)
+    PrintMsg("Starte Test-Alarm für |cffffd100" .. playerName .. "|r...")
+    TriggerAlert(playerName, playerName, guildName, guildRank, classFile, factionGroup)
 end
 
 -- ============================================================================
@@ -461,6 +752,11 @@ local function InitializeDatabase()
     if GuildScannerDB.soundEnabled == nil then
         GuildScannerDB.soundEnabled = DEFAULT_DB.soundEnabled
     end
+    if GuildScannerDB.leaderboardEnabled == nil then
+        GuildScannerDB.leaderboardEnabled = DEFAULT_DB.leaderboardEnabled
+    end
+    EnsureLeaderboardTables()
+    RebuildGuildTotalsFromPlayers()
     RestoreFramePosition()
 end
 
@@ -468,7 +764,7 @@ end
 -- Einstellungsfenster (GUI)
 -- ============================================================================
 local configFrame = CreateFrame("Frame", "GuildScannerConfigFrame", UIParent, "BackdropTemplate")
-configFrame:SetSize(380, 440)
+configFrame:SetSize(380, 495)
 configFrame:SetPoint("CENTER")
 configFrame:SetFrameStrata("DIALOG")
 configFrame:SetClampedToScreen(true)
@@ -477,7 +773,6 @@ configFrame:EnableMouse(true)
 configFrame:RegisterForDrag("LeftButton")
 configFrame:Hide()
 
--- Mit ESC schließen erlauben
 tinsert(UISpecialFrames, "GuildScannerConfigFrame")
 
 configFrame:SetBackdrop({
@@ -504,7 +799,7 @@ configTitle:SetText("|cff00ccffGuildScanner|r – Einstellungen")
 
 local configSubtitle = configFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 configSubtitle:SetPoint("TOP", configTitle, "BOTTOM", 0, -4)
-configSubtitle:SetText("Überwachte Gilden verwalten & Alarme anpassen")
+configSubtitle:SetText("Überwachte Gilden verwalten & Gilden-Leaderboard")
 
 -- Schließen-Button oben rechts
 local configCloseBtn = CreateFrame("Button", nil, configFrame, "UIPanelCloseButton")
@@ -570,7 +865,7 @@ listHeader:SetText("Überwachte Gilden (Watchlist):")
 
 local listBg = CreateFrame("Frame", nil, configFrame, "BackdropTemplate")
 listBg:SetPoint("TOPLEFT", listHeader, "BOTTOMLEFT", 0, -6)
-listBg:SetSize(340, 185)
+listBg:SetSize(340, 175)
 listBg:SetBackdrop({
     bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -599,7 +894,6 @@ local rowFrames = {}
 RefreshWatchlistUI = function()
     if not GuildScannerDB or not GuildScannerDB.watchlist then return end
 
-    -- Sortierte Liste der Gilden erstellen
     local sorted = {}
     for key, originalName in pairs(GuildScannerDB.watchlist) do
         table.insert(sorted, { key = key, name = originalName })
@@ -659,7 +953,7 @@ end
 -- Sound-Checkbox
 local soundCheckbox = CreateFrame("CheckButton", "GuildScannerSoundCheck", configFrame, "UICheckButtonTemplate")
 soundCheckbox:SetSize(24, 24)
-soundCheckbox:SetPoint("TOPLEFT", listBg, "BOTTOMLEFT", 0, -10)
+soundCheckbox:SetPoint("TOPLEFT", listBg, "BOTTOMLEFT", 0, -8)
 local soundLabel = soundCheckbox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 soundLabel:SetPoint("LEFT", soundCheckbox, "RIGHT", 4, 0)
 soundLabel:SetText("Warnsound bei Gilden-Erkennung abspielen")
@@ -667,6 +961,37 @@ soundLabel:SetText("Warnsound bei Gilden-Erkennung abspielen")
 soundCheckbox:SetScript("OnClick", function(self)
     if GuildScannerDB then
         GuildScannerDB.soundEnabled = self:GetChecked() and true or false
+    end
+end)
+
+-- Leaderboard-Checkbox (Optional an-/abwählbar)
+local lbCheckbox = CreateFrame("CheckButton", "GuildScannerLeaderboardCheck", configFrame, "UICheckButtonTemplate")
+lbCheckbox:SetSize(24, 24)
+lbCheckbox:SetPoint("TOPLEFT", soundCheckbox, "BOTTOMLEFT", 0, -2)
+local lbLabel = lbCheckbox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+lbLabel:SetPoint("LEFT", lbCheckbox, "RIGHT", 4, 0)
+lbLabel:SetText("Gilden-Kill-Leaderboard aktivieren & mit Gilde synchronisieren")
+
+lbCheckbox:SetScript("OnClick", function(self)
+    if GuildScannerDB then
+        GuildScannerDB.leaderboardEnabled = self:GetChecked() and true or false
+        if GuildScannerDB.leaderboardEnabled then
+            PrintMsg("Gilden-Leaderboard |cff40ff40aktiviert|r.")
+            RequestGuildLeaderboardSync(false)
+        else
+            PrintMsg("Gilden-Leaderboard |cffff5555deaktiviert|r.")
+        end
+    end
+end)
+
+-- Button: Leaderboard öffnen
+local openLbBtn = CreateFrame("Button", nil, configFrame, "UIPanelButtonTemplate")
+openLbBtn:SetSize(340, 26)
+openLbBtn:SetPoint("BOTTOM", configFrame, "BOTTOM", 0, 48)
+openLbBtn:SetText("|cffffd100Gilden-Kill-Leaderboard öffnen|r")
+openLbBtn:SetScript("OnClick", function()
+    if ToggleLeaderboardFrame then
+        ToggleLeaderboardFrame()
     end
 end)
 
@@ -693,8 +1018,327 @@ ToggleConfigFrame = function()
         configFrame:Hide()
     else
         soundCheckbox:SetChecked(GuildScannerDB.soundEnabled ~= false)
+        lbCheckbox:SetChecked(GuildScannerDB.leaderboardEnabled ~= false)
         RefreshWatchlistUI()
         configFrame:Show()
+    end
+end
+
+-- ============================================================================
+-- Gilden-Kill-Leaderboard Fenster (Ranking Pro Spieler & Pro Markierter Gilde)
+-- ============================================================================
+local lbFrame = CreateFrame("Frame", "GuildScannerLeaderboardFrame", UIParent, "BackdropTemplate")
+lbFrame:SetSize(420, 440)
+lbFrame:SetPoint("CENTER", UIParent, "CENTER", 220, 0)
+lbFrame:SetFrameStrata("DIALOG")
+lbFrame:SetClampedToScreen(true)
+lbFrame:SetMovable(true)
+lbFrame:EnableMouse(true)
+lbFrame:RegisterForDrag("LeftButton")
+lbFrame:Hide()
+
+tinsert(UISpecialFrames, "GuildScannerLeaderboardFrame")
+
+lbFrame:SetBackdrop({
+    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Gold-Border",
+    tile = true,
+    tileSize = 32,
+    edgeSize = 32,
+    insets = { left = 8, right = 8, top = 8, bottom = 8 },
+})
+lbFrame:SetBackdropColor(0.05, 0.05, 0.07, 0.96)
+
+lbFrame:SetScript("OnDragStart", function(self)
+    self:StartMoving()
+end)
+lbFrame:SetScript("OnDragStop", function(self)
+    self:StopMovingOrSizing()
+end)
+
+local lbTitle = lbFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+lbTitle:SetPoint("TOP", lbFrame, "TOP", 0, -16)
+lbTitle:SetText("|cffffd100GuildScanner|r – Kill-Leaderboard")
+
+local lbSubTitle = lbFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+lbSubTitle:SetPoint("TOP", lbTitle, "BOTTOM", 0, -4)
+lbSubTitle:SetText("Synchronisiert zwischen allen Gildenmitgliedern mit GuildScanner")
+
+local lbCloseBtn = CreateFrame("Button", nil, lbFrame, "UIPanelCloseButton")
+lbCloseBtn:SetPoint("TOPRIGHT", lbFrame, "TOPRIGHT", -5, -5)
+
+-- Tab-Auswahl: "players" (Pro Gildenmitglied) oder "guilds" (Pro Markierter Gilde)
+local activeLbTab = "players"
+
+local tabPlayersBtn = CreateFrame("Button", nil, lbFrame, "UIPanelButtonTemplate")
+tabPlayersBtn:SetSize(185, 26)
+tabPlayersBtn:SetPoint("TOPLEFT", lbFrame, "TOPLEFT", 20, -54)
+tabPlayersBtn:SetText("Ranking: Spieler (Gilde)")
+
+local tabGuildsBtn = CreateFrame("Button", nil, lbFrame, "UIPanelButtonTemplate")
+tabGuildsBtn:SetSize(185, 26)
+tabGuildsBtn:SetPoint("TOPRIGHT", lbFrame, "TOPRIGHT", -20, -54)
+tabGuildsBtn:SetText("Ranking: Markierte Gilden")
+
+-- Spalten-Header
+local colHeaderLeft = lbFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+colHeaderLeft:SetPoint("TOPLEFT", tabPlayersBtn, "BOTTOMLEFT", 6, -10)
+colHeaderLeft:SetText("#   Name")
+
+local colHeaderRight = lbFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+colHeaderRight:SetPoint("TOPRIGHT", tabGuildsBtn, "BOTTOMRIGHT", -28, -10)
+colHeaderRight:SetText("Kills")
+
+-- Scroll-Container für das Ranking
+local lbListBg = CreateFrame("Frame", nil, lbFrame, "BackdropTemplate")
+lbListBg:SetPoint("TOPLEFT", tabPlayersBtn, "BOTTOMLEFT", 0, -26)
+lbListBg:SetSize(380, 290)
+lbListBg:SetBackdrop({
+    bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true,
+    tileSize = 16,
+    edgeSize = 14,
+    insets = { left = 3, right = 3, top = 3, bottom = 3 },
+})
+lbListBg:SetBackdropColor(0.02, 0.02, 0.03, 0.88)
+lbListBg:SetBackdropBorderColor(0.6, 0.5, 0.2, 0.9)
+
+local lbScrollFrame = CreateFrame("ScrollFrame", "GuildScannerLeaderboardScrollFrame", lbListBg, "UIPanelScrollFrameTemplate")
+lbScrollFrame:SetPoint("TOPLEFT", lbListBg, "TOPLEFT", 6, -6)
+lbScrollFrame:SetPoint("BOTTOMRIGHT", lbListBg, "BOTTOMRIGHT", -26, 6)
+
+local lbScrollChild = CreateFrame("Frame", nil, lbScrollFrame)
+lbScrollChild:SetSize(340, 1)
+lbScrollFrame:SetScrollChild(lbScrollChild)
+
+local lbEmptyText = lbListBg:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+lbEmptyText:SetPoint("CENTER", lbListBg, "CENTER", -8, 0)
+lbEmptyText:SetText("Noch keine Kills gegen markierte Gilden aufgezeichnet.")
+
+local lbRows = {}
+
+local function FormatRankBadge(rank)
+    if rank == 1 then
+        return "|cffffd7001.|r"
+    elseif rank == 2 then
+        return "|cffc0c0c02.|r"
+    elseif rank == 3 then
+        return "|cffcd7f323.|r"
+    end
+    return string.format("|cff888888%d.|r", rank)
+end
+
+RefreshLeaderboardUI = function()
+    if not GuildScannerDB then return end
+    EnsureLeaderboardTables()
+    RebuildGuildTotalsFromPlayers()
+
+    if activeLbTab == "players" then
+        tabPlayersBtn:Disable()
+        tabGuildsBtn:Enable()
+        colHeaderLeft:SetText("Rang & Gildenmitglied (Hover für Details)")
+        colHeaderRight:SetText("Kills gesamt")
+    else
+        tabPlayersBtn:Enable()
+        tabGuildsBtn:Disable()
+        colHeaderLeft:SetText("Rang & Überwachte Gilde")
+        colHeaderRight:SetText("Besiegte Spieler")
+    end
+
+    for _, r in ipairs(lbRows) do
+        r:Hide()
+    end
+
+    local entries = {}
+    local lb = GuildScannerDB.leaderboard
+
+    if activeLbTab == "players" then
+        for playerName, pData in pairs(lb.players) do
+            if (pData.kills or 0) > 0 then
+                table.insert(entries, {
+                    name = playerName,
+                    kills = pData.kills or 0,
+                    classFile = pData.classFile,
+                    byGuild = pData.byGuild,
+                })
+            end
+        end
+    else
+        -- Alle markierten Gilden sowie Gilden mit aufgezeichneten Kills anzeigen
+        local seenKeys = {}
+        if GuildScannerDB.watchlist then
+            for gKey, origName in pairs(GuildScannerDB.watchlist) do
+                seenKeys[gKey] = true
+                local gEntry = lb.guilds[gKey]
+                table.insert(entries, {
+                    key = gKey,
+                    name = origName,
+                    kills = (gEntry and gEntry.kills) or 0,
+                })
+            end
+        end
+        for gKey, gData in pairs(lb.guilds) do
+            if not seenKeys[gKey] and (gData.kills or 0) > 0 then
+                table.insert(entries, {
+                    key = gKey,
+                    name = gData.name or gKey,
+                    kills = gData.kills or 0,
+                })
+            end
+        end
+    end
+
+    table.sort(entries, function(a, b)
+        if a.kills ~= b.kills then
+            return a.kills > b.kills
+        end
+        return string.lower(a.name) < string.lower(b.name)
+    end)
+
+    if #entries == 0 then
+        lbEmptyText:Show()
+        lbScrollChild:SetHeight(1)
+        return
+    end
+
+    lbEmptyText:Hide()
+    local rowHeight = 28
+
+    for i, item in ipairs(entries) do
+        local row = lbRows[i]
+        if not row then
+            row = CreateFrame("Frame", nil, lbScrollChild, "BackdropTemplate")
+            row:SetSize(344, rowHeight - 2)
+            row:SetBackdrop({
+                bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+            })
+            row:EnableMouse(true)
+
+            row.rankText = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            row.rankText:SetPoint("LEFT", row, "LEFT", 8, 0)
+            row.rankText:SetWidth(28)
+            row.rankText:SetJustifyH("LEFT")
+
+            row.nameText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+            row.nameText:SetPoint("LEFT", row.rankText, "RIGHT", 4, 0)
+            row.nameText:SetPoint("RIGHT", row, "RIGHT", -65, 0)
+            row.nameText:SetJustifyH("LEFT")
+            row.nameText:SetWordWrap(false)
+
+            row.killsText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+            row.killsText:SetPoint("RIGHT", row, "RIGHT", -12, 0)
+            row.killsText:SetJustifyH("RIGHT")
+
+            lbRows[i] = row
+        end
+
+        if i == 1 then
+            row:SetBackdropColor(0.35, 0.28, 0.05, 0.55)
+        elseif i % 2 == 0 then
+            row:SetBackdropColor(0.14, 0.14, 0.18, 0.45)
+        else
+            row:SetBackdropColor(0.09, 0.09, 0.12, 0.45)
+        end
+
+        row:SetPoint("TOPLEFT", lbScrollChild, "TOPLEFT", 0, -((i - 1) * rowHeight))
+        row.rankText:SetText(FormatRankBadge(i))
+
+        if activeLbTab == "players" then
+            local colorHex = GetClassColorHex(item.classFile)
+            row.nameText:SetText("|c" .. colorHex .. item.name .. "|r")
+            row.killsText:SetText("|cffffd100" .. tostring(item.kills) .. "|r")
+
+            row:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:AddLine(item.name .. " – Kill-Statistik", 0.0, 0.8, 1.0)
+                GameTooltip:AddLine("Gesamte Kills: " .. tostring(item.kills), 1, 0.82, 0)
+                if type(item.byGuild) == "table" then
+                    GameTooltip:AddLine(" ")
+                    GameTooltip:AddLine("Kills pro markierter Gilde:", 0.8, 0.8, 0.8)
+                    for gKey, c in pairs(item.byGuild) do
+                        if c and c > 0 then
+                            local gName = (lb.guilds[gKey] and lb.guilds[gKey].name)
+                                or (GuildScannerDB.watchlist and GuildScannerDB.watchlist[gKey])
+                                or gKey
+                            GameTooltip:AddDoubleLine("<" .. gName .. ">", tostring(c), 0.25, 1.0, 0.25, 1, 1, 1)
+                        end
+                    end
+                end
+                GameTooltip:Show()
+            end)
+            row:SetScript("OnLeave", function()
+                GameTooltip:Hide()
+            end)
+        else
+            row.nameText:SetText("|cff40ff40<" .. item.name .. ">|r")
+            row.killsText:SetText("|cffff5555" .. tostring(item.kills) .. "|r")
+
+            row:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:AddLine("<" .. item.name .. ">", 0.25, 1.0, 0.25)
+                GameTooltip:AddLine("Besiegte Mitglieder gesamt: " .. tostring(item.kills), 1, 0.82, 0)
+                GameTooltip:AddLine(" ")
+                GameTooltip:AddLine("Top-Jäger deiner Gilde:", 0.8, 0.8, 0.8)
+                for pName, pData in pairs(lb.players) do
+                    local c = pData.byGuild and pData.byGuild[item.key]
+                    if c and c > 0 then
+                        local colorHex = GetClassColorHex(pData.classFile)
+                        GameTooltip:AddDoubleLine("|c" .. colorHex .. pName .. "|r", tostring(c), 1, 1, 1, 1, 0.82, 0)
+                    end
+                end
+                GameTooltip:Show()
+            end)
+            row:SetScript("OnLeave", function()
+                GameTooltip:Hide()
+            end)
+        end
+
+        row:Show()
+    end
+
+    lbScrollChild:SetHeight(#entries * rowHeight)
+end
+
+tabPlayersBtn:SetScript("OnClick", function()
+    activeLbTab = "players"
+    RefreshLeaderboardUI()
+end)
+
+tabGuildsBtn:SetScript("OnClick", function()
+    activeLbTab = "guilds"
+    RefreshLeaderboardUI()
+end)
+
+-- Untere Buttons im Leaderboard: "Mit Gilde synchronisieren" & "Eigenen Stand senden"
+local syncLbBtn = CreateFrame("Button", nil, lbFrame, "UIPanelButtonTemplate")
+syncLbBtn:SetSize(240, 26)
+syncLbBtn:SetPoint("BOTTOMLEFT", lbFrame, "BOTTOMLEFT", 20, 16)
+syncLbBtn:SetText("Mit Gilde synchronisieren")
+syncLbBtn:SetScript("OnClick", function()
+    RequestGuildLeaderboardSync(true)
+end)
+
+local resetLbBtn = CreateFrame("Button", nil, lbFrame, "UIPanelButtonTemplate")
+resetLbBtn:SetSize(130, 26)
+resetLbBtn:SetPoint("BOTTOMRIGHT", lbFrame, "BOTTOMRIGHT", -20, 16)
+resetLbBtn:SetText("Reset (Lokal)")
+resetLbBtn:SetScript("OnClick", function()
+    if GuildScannerDB then
+        GuildScannerDB.leaderboard = { players = {}, guilds = {} }
+        RefreshLeaderboardUI()
+        PrintMsg("Lokales Leaderboard wurde zurückgesetzt.")
+    end
+end)
+
+ToggleLeaderboardFrame = function()
+    InitializeDatabase()
+    if lbFrame:IsShown() then
+        lbFrame:Hide()
+    else
+        RefreshLeaderboardUI()
+        lbFrame:Show()
+        RequestGuildLeaderboardSync(false)
     end
 end
 
@@ -751,9 +1395,17 @@ end)
 
 minimapButton:SetScript("OnClick", function(self, button)
     if button == "LeftButton" then
-        ToggleConfigFrame()
+        if IsShiftKeyDown() then
+            ToggleLeaderboardFrame()
+        else
+            ToggleConfigFrame()
+        end
     elseif button == "RightButton" then
-        RunTestAlert()
+        if IsShiftKeyDown() then
+            RunTestAlert()
+        else
+            ToggleLeaderboardFrame()
+        end
     end
 end)
 
@@ -761,7 +1413,8 @@ minimapButton:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_LEFT")
     GameTooltip:AddLine("GuildScanner", 0.0, 0.8, 1.0)
     GameTooltip:AddLine("Linksklick: Einstellungen öffnen", 1, 1, 1)
-    GameTooltip:AddLine("Rechtsklick: Test-Alarm auslösen", 0.8, 0.8, 0.8)
+    GameTooltip:AddLine("Rechtsklick: Kill-Leaderboard öffnen", 1, 0.82, 0)
+    GameTooltip:AddLine("Shift + Rechtsklick: Test-Alarm auslösen", 0.8, 0.8, 0.8)
     GameTooltip:AddLine("Ziehen: Icon um die Minimap bewegen", 0.6, 0.6, 0.6)
     GameTooltip:Show()
 end)
@@ -798,6 +1451,19 @@ local function RegisterBlizzardOptionsPanel()
         ToggleConfigFrame()
     end)
 
+    local openLbOptBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    openLbOptBtn:SetSize(220, 28)
+    openLbOptBtn:SetPoint("TOPLEFT", openGuiBtn, "BOTTOMLEFT", 0, -10)
+    openLbOptBtn:SetText("Kill-Leaderboard öffnen")
+    openLbOptBtn:SetScript("OnClick", function()
+        if SettingsPanel and SettingsPanel:IsShown() then
+            HideUIPanel(SettingsPanel)
+        elseif InterfaceOptionsFrame and InterfaceOptionsFrame:IsShown() then
+            InterfaceOptionsFrame:Hide()
+        end
+        ToggleLeaderboardFrame()
+    end)
+
     if Settings and Settings.RegisterCanvasLayoutCategory then
         local category = Settings.RegisterCanvasLayoutCategory(panel, panel.name)
         Settings.RegisterAddOnCategory(category)
@@ -807,7 +1473,7 @@ local function RegisterBlizzardOptionsPanel()
 end
 
 -- ============================================================================
--- Erkennungs-Engine (Ohne Combat Log!)
+-- Erkennungs-Engine & Kill-Detektor (Ohne Combat Log!)
 -- ============================================================================
 local function IsPlayerOnCooldown(shortName)
     local now = GetTime()
@@ -817,6 +1483,79 @@ local function IsPlayerOnCooldown(shortName)
     end
     recentDetections[shortName] = now
     return false
+end
+
+local function IsKillOnCooldown(victimShortName)
+    local now = GetTime()
+    local lastKill = recentKills[victimShortName]
+    if lastKill and (now - lastKill) < KILL_DEDUP_SECONDS then
+        return true
+    end
+    recentKills[victimShortName] = now
+    return false
+end
+
+-- Prüft ohne Combat-Log, ob eine überwachte feindliche Einheit gerade durch uns / im Kampf gestorben ist
+local function CheckUnitKillState(unit)
+    if not GuildScannerDB or not GuildScannerDB.leaderboardEnabled then return end
+    if not unit or IsSecret(unit) then return end
+    if UnitIsForbidden and SafeIsTrue(UnitIsForbidden(unit)) then return end
+    if not SafeIsTrue(UnitExists(unit)) or not SafeIsTrue(UnitIsPlayer(unit)) then return end
+    if SafeIsTrue(UnitIsUnit(unit, "player")) then return end
+
+    -- Nur feindliche / angreifbare Spieler für PvP-Kills werten
+    local canAttack = SafeIsTrue(UnitCanAttack("player", unit))
+    local isEnemy = SafeIsTrue(UnitIsEnemy("player", unit))
+    if not canAttack and not isEnemy then
+        return
+    end
+
+    local rawGuildName = GetGuildInfo(unit)
+    local guildName = SafeString(rawGuildName)
+    if not guildName then return end
+
+    local guildKey = string.lower(guildName)
+    local watchedGuild = GuildScannerDB.watchlist and GuildScannerDB.watchlist[guildKey]
+    if not watchedGuild then return end
+
+    local fullName = GetFullPlayerName(unit)
+    if not fullName then return end
+    local shortName = SafeString(Ambiguate(fullName, "none")) or fullName
+
+    local isDead = SafeIsTrue(UnitIsDeadOrGhost(unit))
+    local prev = trackedUnits[unit]
+
+    -- Wenn der Spieler das Ziel aktiv anvisiert hat, als letztes Ziel vormerken
+    if unit == "target" and not isDead then
+        lastDamagedTarget = {
+            name = shortName,
+            guildName = watchedGuild,
+            guildKey = guildKey,
+            time = GetTime(),
+        }
+    end
+
+    -- Übergang von Lebend -> Tot erkannt, während wir im Kampf sind oder das Ziel anvisiert haben
+    if isDead and prev and prev.name == shortName and prev.wasAlive then
+        prev.wasAlive = false
+        local isCurrentTarget = SafeIsTrue(UnitIsUnit(unit, "target"))
+        local wasRecentTarget = lastDamagedTarget
+            and lastDamagedTarget.name == shortName
+            and (GetTime() - lastDamagedTarget.time) <= 15
+
+        if (isCurrentTarget or wasRecentTarget or InCombatLockdown()) and not IsKillOnCooldown(shortName) then
+            local myName = GetLocalPlayerShortName()
+            local _, myClass = UnitClass("player")
+            RecordWatchedGuildKill(myName, SafeString(myClass), shortName, watchedGuild, false)
+        end
+    else
+        trackedUnits[unit] = {
+            name = shortName,
+            guildName = watchedGuild,
+            guildKey = guildKey,
+            wasAlive = not isDead,
+        }
+    end
 end
 
 local function CheckUnitInternal(unit, allowSelfForTest)
@@ -864,6 +1603,24 @@ local function CheckUnitInternal(unit, allowSelfForTest)
     end
 
     local shortName = SafeString(Ambiguate(fullName, "none")) or fullName
+
+    -- Einheit für Kill-Detektor vormerken
+    local isDead = SafeIsTrue(UnitIsDeadOrGhost(unit))
+    trackedUnits[unit] = {
+        name = shortName,
+        guildName = watchedGuild,
+        guildKey = guildKey,
+        wasAlive = not isDead,
+    }
+    if unit == "target" and not isDead then
+        lastDamagedTarget = {
+            name = shortName,
+            guildName = watchedGuild,
+            guildKey = guildKey,
+            time = GetTime(),
+        }
+    end
+
     if not allowSelfForTest and IsPlayerOnCooldown(shortName) then
         return
     end
@@ -877,7 +1634,6 @@ local function CheckUnitInternal(unit, allowSelfForTest)
 end
 
 local function CheckUnit(unit, allowSelfForTest)
-    -- Zusätzlicher pcall-Schutz gegen unvorhergesehene Midnight/Forever Secret-Value-Restriktionen
     pcall(CheckUnitInternal, unit, allowSelfForTest)
 end
 
@@ -885,16 +1641,27 @@ end
 -- Event-Handler
 -- ============================================================================
 GuildScanner:RegisterEvent("ADDON_LOADED")
+GuildScanner:RegisterEvent("PLAYER_ENTERING_WORLD")
 GuildScanner:RegisterEvent("NAME_PLATE_UNIT_ADDED")
+GuildScanner:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
 GuildScanner:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
 GuildScanner:RegisterEvent("PLAYER_TARGET_CHANGED")
 GuildScanner:RegisterEvent("UNIT_TARGET")
+GuildScanner:RegisterEvent("UNIT_HEALTH")
+GuildScanner:RegisterEvent("UNIT_FLAGS")
+GuildScanner:RegisterEvent("PLAYER_PVP_KILLS_CHANGED")
+GuildScanner:RegisterEvent("CHAT_MSG_ADDON")
 GuildScanner:RegisterEvent("PLAYER_REGEN_ENABLED")
 
-GuildScanner:SetScript("OnEvent", function(self, event, arg1)
+GuildScanner:SetScript("OnEvent", function(self, event, arg1, arg2, arg3, arg4)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
             InitializeDatabase()
+            if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
+                C_ChatInfo.RegisterAddonMessagePrefix(COMM_PREFIX)
+            elseif RegisterAddonMessagePrefix then
+                RegisterAddonMessagePrefix(COMM_PREFIX)
+            end
             UpdateMinimapButtonPosition()
             if GuildScannerDB.hideMinimapButton then
                 minimapButton:Hide()
@@ -902,20 +1669,60 @@ GuildScanner:SetScript("OnEvent", function(self, event, arg1)
                 minimapButton:Show()
             end
             RegisterBlizzardOptionsPanel()
-            PrintMsg("Geladen (v1.1.3). Klicke auf das |cffffd100Minimap-Icon|r oder tippe |cffffd100/gscan|r.")
+            PrintMsg("Geladen (v1.2.0). |cffffd100Linksklick|r aufs Minimap-Icon: Einstellungen | |cffffd100Rechtsklick|r: Kill-Leaderboard.")
         end
+
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        -- Nach Login / Reload einmalig mit Gildenmitgliedern synchronisieren
+        C_Timer.After(4.0, function()
+            RequestGuildLeaderboardSync(false)
+        end)
+
     elseif event == "NAME_PLATE_UNIT_ADDED" then
         CheckUnit(arg1, false)
+
+    elseif event == "NAME_PLATE_UNIT_REMOVED" then
+        if arg1 and not IsSecret(arg1) then
+            trackedUnits[arg1] = nil
+        end
+
     elseif event == "UPDATE_MOUSEOVER_UNIT" then
         CheckUnit("mouseover", false)
+
     elseif event == "PLAYER_TARGET_CHANGED" then
         CheckUnit("target", false)
+        pcall(CheckUnitKillState, "target")
+
     elseif event == "UNIT_TARGET" then
-        -- Verkettete Nameplate-Targets (z.B. "nameplate2target") liefern in 12.x/Forever
-        -- geschützte "Secret Values" (<secret boolean>), daher nur sichere Unit-Tokens prüfen
         if arg1 and not IsSecret(arg1) and arg1 ~= "player" and not string.find(arg1, "^nameplate") then
             CheckUnit(arg1 .. "target", false)
         end
+
+    elseif event == "UNIT_HEALTH" or event == "UNIT_FLAGS" then
+        if arg1 and not IsSecret(arg1) and (arg1 == "target" or string.find(arg1, "^nameplate")) then
+            pcall(CheckUnitKillState, arg1)
+        end
+
+    elseif event == "PLAYER_PVP_KILLS_CHANGED" then
+        -- Ehrenhafter Sieg erhalten: Prüfen, ob unser aktuelles/letztes Ziel aus einer überwachten Gilde stammt
+        pcall(CheckUnitKillState, "target")
+        if lastDamagedTarget and (GetTime() - lastDamagedTarget.time) <= 15 then
+            if not IsKillOnCooldown(lastDamagedTarget.name) then
+                local myName = GetLocalPlayerShortName()
+                local _, myClass = UnitClass("player")
+                RecordWatchedGuildKill(
+                    myName,
+                    SafeString(myClass),
+                    lastDamagedTarget.name,
+                    lastDamagedTarget.guildName,
+                    false
+                )
+            end
+        end
+
+    elseif event == "CHAT_MSG_ADDON" then
+        pcall(HandleAddonMessage, arg1, arg2, arg3, arg4)
+
     elseif event == "PLAYER_REGEN_ENABLED" then
         if pendingAlert then
             local alertData = pendingAlert
@@ -936,6 +1743,8 @@ end)
 local function ShowHelp()
     PrintMsg("Befehlsübersicht:")
     PrintMsg("  |cffffd100/gscan|r oder |cffffd100/gscan config|r - Öffnet das Einstellungsfenster")
+    PrintMsg("  |cffffd100/gscan lb|r oder |cffffd100/gscan leaderboard|r - Öffnet das Gilden-Kill-Leaderboard")
+    PrintMsg("  |cffffd100/gscan sync|r - Synchronisiert das Leaderboard mit deiner Gilde")
     PrintMsg("  |cffffd100/gscan add <Gildenname>|r - Fügt eine Gilde zur Watchlist hinzu")
     PrintMsg("  |cffffd100/gscan remove <Gildenname>|r - Entfernt eine Gilde von der Watchlist")
     PrintMsg("  |cffffd100/gscan list|r - Zeigt alle überwachten Gilden im Chat an")
@@ -955,6 +1764,12 @@ SlashCmdList["GUILDSCANNER"] = function(msg)
 
     if cmd == "" or cmd == "config" or cmd == "options" or cmd == "gui" then
         ToggleConfigFrame()
+
+    elseif cmd == "lb" or cmd == "leaderboard" or cmd == "ranking" or cmd == "kills" then
+        ToggleLeaderboardFrame()
+
+    elseif cmd == "sync" then
+        RequestGuildLeaderboardSync(true)
 
     elseif cmd == "add" then
         if rest == "" then
