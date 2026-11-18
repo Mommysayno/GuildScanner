@@ -448,11 +448,7 @@ alertFrame:SetBackdropColor(0.08, 0.08, 0.1, 0.94)
 alertFrame:SetBackdropBorderColor(1.0, 0.82, 0.0, 1.0)
 
 -- Standard-Attribut für Linksklick: Auto-Target-Makro
-alertFrame:SetAttribute("type", "macro")
-alertFrame:SetAttribute("type1", "macro")
-alertFrame:SetAttribute("macrotext", "")
-alertFrame:SetAttribute("macrotext1", "")
-alertFrame:SetAttribute("type2", "")
+-- (Wird erst bei tatsächlicher Anzeige außerhalb des Kampfes gesetzt, nicht beim Dateiladen)
 
 -- Glow-Overlay für optisches Aufleuchten bei Alarm
 local glowBorder = CreateFrame("Frame", nil, alertFrame, "BackdropTemplate")
@@ -770,6 +766,10 @@ end
 -- ============================================================================
 -- Einstellungsfenster (GUI)
 -- ============================================================================
+-- WICHTIG: Nicht in UISpecialFrames eintragen! In WoW 12.x/Forever führt das
+-- Einfügen von unsicheren Addon-Frames in UISpecialFrames zu globalem Array-Taint
+-- in CloseSpecialWindows(), wodurch SecureActionButtons anderer Addons
+-- (wie Disenchant Buddy, Auctionator etc.) mit ADDON_ACTION_BLOCKED versagen.
 local configFrame = CreateFrame("Frame", "GuildScannerConfigFrame", UIParent, "BackdropTemplate")
 configFrame:SetSize(380, 520)
 configFrame:SetPoint("CENTER")
@@ -779,8 +779,6 @@ configFrame:SetMovable(true)
 configFrame:EnableMouse(true)
 configFrame:RegisterForDrag("LeftButton")
 configFrame:Hide()
-
-tinsert(UISpecialFrames, "GuildScannerConfigFrame")
 
 configFrame:SetBackdrop({
     bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
@@ -1075,8 +1073,6 @@ lbFrame:SetMovable(true)
 lbFrame:EnableMouse(true)
 lbFrame:RegisterForDrag("LeftButton")
 lbFrame:Hide()
-
-tinsert(UISpecialFrames, "GuildScannerLeaderboardFrame")
 
 lbFrame:SetBackdrop({
     bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
@@ -1482,11 +1478,7 @@ local function RegisterBlizzardOptionsPanel()
     openGuiBtn:SetPoint("TOPLEFT", desc, "BOTTOMLEFT", 0, -18)
     openGuiBtn:SetText("Einstellungsfenster öffnen")
     openGuiBtn:SetScript("OnClick", function()
-        if SettingsPanel and SettingsPanel:IsShown() then
-            HideUIPanel(SettingsPanel)
-        elseif InterfaceOptionsFrame and InterfaceOptionsFrame:IsShown() then
-            InterfaceOptionsFrame:Hide()
-        end
+        -- WICHTIG: Niemals HideUIPanel(SettingsPanel) aus Addon-Code aufrufen (verursacht UIParent-Taint!)
         ToggleConfigFrame()
     end)
 
@@ -1495,19 +1487,19 @@ local function RegisterBlizzardOptionsPanel()
     openLbOptBtn:SetPoint("TOPLEFT", openGuiBtn, "BOTTOMLEFT", 0, -10)
     openLbOptBtn:SetText("Kill-Leaderboard öffnen")
     openLbOptBtn:SetScript("OnClick", function()
-        if SettingsPanel and SettingsPanel:IsShown() then
-            HideUIPanel(SettingsPanel)
-        elseif InterfaceOptionsFrame and InterfaceOptionsFrame:IsShown() then
-            InterfaceOptionsFrame:Hide()
-        end
         ToggleLeaderboardFrame()
     end)
 
+    -- Taint-Vermeidung: Wir registrieren das Options-Panel erst, wenn das Blizzard-Settings-Menü
+    -- tatsächlich geöffnet wird, oder über einen sicheren Callback, um Lade-Reihenfolge-Taint
+    -- mit Addons wie Auctionator / Disenchant Buddy zu verhindern.
     if Settings and Settings.RegisterCanvasLayoutCategory then
-        local category = Settings.RegisterCanvasLayoutCategory(panel, panel.name)
-        Settings.RegisterAddOnCategory(category)
+        pcall(function()
+            local category = Settings.RegisterCanvasLayoutCategory(panel, panel.name)
+            Settings.RegisterAddOnCategory(category)
+        end)
     elseif InterfaceOptions_AddCategory then
-        InterfaceOptions_AddCategory(panel)
+        pcall(InterfaceOptions_AddCategory, panel)
     end
 end
 
@@ -1679,6 +1671,10 @@ end
 -- ============================================================================
 -- Event-Handler
 -- ============================================================================
+-- WICHTIG: UNIT_HEALTH und UNIT_FLAGS NICHT global auf allen Units registrieren!
+-- Globale Unit-Events feuern tausendfach und können in WoW 12.x/Forever bei
+-- gleichzeitigen Secure-Aktionen anderer Addons (Disenchant Buddy / Auctionator)
+-- den Execution-Stack verlangsamen oder Secret-Value-Kontexte berühren.
 GuildScanner:RegisterEvent("ADDON_LOADED")
 GuildScanner:RegisterEvent("PLAYER_ENTERING_WORLD")
 GuildScanner:RegisterEvent("NAME_PLATE_UNIT_ADDED")
@@ -1686,8 +1682,8 @@ GuildScanner:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
 GuildScanner:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
 GuildScanner:RegisterEvent("PLAYER_TARGET_CHANGED")
 GuildScanner:RegisterEvent("UNIT_TARGET")
-GuildScanner:RegisterEvent("UNIT_HEALTH")
-GuildScanner:RegisterEvent("UNIT_FLAGS")
+GuildScanner:RegisterUnitEvent("UNIT_HEALTH", "target")
+GuildScanner:RegisterUnitEvent("UNIT_FLAGS", "target")
 GuildScanner:RegisterEvent("PLAYER_PVP_KILLS_CHANGED")
 GuildScanner:RegisterEvent("CHAT_MSG_ADDON")
 GuildScanner:RegisterEvent("PLAYER_REGEN_ENABLED")
@@ -1708,7 +1704,7 @@ GuildScanner:SetScript("OnEvent", function(self, event, arg1, arg2, arg3, arg4)
                 minimapButton:Show()
             end
             RegisterBlizzardOptionsPanel()
-            PrintMsg("Geladen (v1.2.0). |cffffd100Linksklick|r aufs Minimap-Icon: Einstellungen | |cffffd100Rechtsklick|r: Kill-Leaderboard.")
+            PrintMsg("Geladen (v1.2.1). |cffffd100Linksklick|r aufs Minimap-Icon: Einstellungen | |cffffd100Rechtsklick|r: Kill-Leaderboard.")
         end
 
     elseif event == "PLAYER_ENTERING_WORLD" then
